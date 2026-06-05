@@ -7,9 +7,11 @@ import re
 import hashlib
 import base64
 import secrets
+import json
+import os
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional
 
 try:
     from curl_cffi import requests as curl_requests
@@ -30,7 +32,7 @@ from urllib3.util.retry import Retry
 
 
 # ==============================================================================
-# Constants
+# Browser Profiles
 # ==============================================================================
 
 BROWSER_PROFILES = {
@@ -75,6 +77,10 @@ BLOCK_SIGNALS = [
 ]
 
 
+# ==============================================================================
+# Helpers
+# ==============================================================================
+
 def _make_std_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -92,13 +98,13 @@ class WAFType:
     NONE = "none"
     VERCEL = "vercel"
     CLOUDFLARE = "cloudflare"
-    AWS = "aws"  # AWS WAF / CloudFront
+    AWS = "aws"
     AKAMAI = "akamai"
-    IMPERVA = "imperva"  # Incapsula
+    IMPERVA = "imperva"
     SUCURI = "sucuri"
-    F5 = "f5"  # BIG-IP ASM
-    FORTINET = "fortinet"  # FortiWeb
-    MODSECURITY = "modsecurity"  # ModSecurity / NAXSI
+    F5 = "f5"
+    FORTINET = "fortinet"
+    MODSECURITY = "modsecurity"
     UNKNOWN = "unknown"
 
 
@@ -509,7 +515,27 @@ class WAFBypass:
     # Main bypass flow
     # ======================================================================
 
-    def bypass(self, url: str) -> WAFResult:
+    def get_bypassed_session(self, url: str, profile_name: str = "chrome136") -> tuple[Optional[CurlSession], WAFResult]:
+        profile_name = profile_name or self.default_profile
+        if not HAS_CURL:
+            return None, WAFResult(url=url, error="curl_cffi not available")
+        probe_result, waf_type = self._probe(url)
+        if waf_type == WAFType.VERCEL:
+            result = self._solve_vercel(url, profile_name)
+            if result.bypassed:
+                session = self._build_curl_session(profile_name)
+                for cookie in result.headers.get_all('set-cookie') if hasattr(result.headers, 'get_all') else []:
+                    pass
+                retry_session = self._build_curl_session(profile_name)
+                retry_session.get(url, allow_redirects=True)
+                return retry_session, result
+        else:
+            session = self._build_curl_session(profile_name)
+            resp = session.get(url, allow_redirects=True)
+            return session, probe_result
+        return None, probe_result
+
+    def bypass(self, url: str, quiet: bool = False) -> WAFResult:
         url = url.strip()
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
@@ -518,170 +544,235 @@ class WAFBypass:
         if not parsed.hostname:
             return WAFResult(url=url, error="Invalid URL", success=False)
 
-        print(f"\n[*] Target: {url}")
-        print(f"[*] Host:   {parsed.hostname}")
-        print(f"[*] Detecting WAF... ", end="")
+        if not quiet:
+            print(f"\n[*] Target: {url}")
+            print(f"[*] Host:   {parsed.hostname}")
+            print(f"[*] Detecting WAF... ", end="")
 
         probe_result, waf_type = self._probe(url)
         self.results.append(probe_result)
 
         if waf_type == WAFType.NONE and probe_result.bypassed:
-            print("none")
-            print(f"[+] Site accessible directly [{probe_result.status_code}]")
+            if not quiet:
+                print("none")
+                print(f"[+] Site accessible directly [{probe_result.status_code}]")
             return probe_result
 
         waf_display = waf_type.upper()
-        print(f"{waf_display}")
+        if not quiet:
+            print(f"{waf_display}")
 
         if probe_result.bypassed and waf_type != WAFType.NONE:
-            print(f"  Status: {probe_result.status_code}")
-            print(f"  WAF detected ({waf_type}) but site is accessible without bypass")
+            if not quiet:
+                print(f"  Status: {probe_result.status_code}")
+                print(f"  WAF detected ({waf_type}) but site is accessible without bypass")
             return probe_result
 
-        print(f"  Status: {probe_result.status_code}")
-        if probe_result.error:
-            print(f"  Reason: {probe_result.error}")
+        if not quiet:
+            print(f"  Status: {probe_result.status_code}")
+            if probe_result.error:
+                print(f"  Reason: {probe_result.error}")
 
         best_result: Optional[WAFResult] = probe_result
 
         if waf_type == WAFType.VERCEL:
-            print(f"  -> Vercel solver... ", end="")
+            if not quiet:
+                print(f"  -> Vercel solver... ", end="")
             r = self._solve_vercel(url)
             self.results.append(r)
             if r.bypassed:
-                print(f"BYPASSED [{r.status_code}]")  ; best_result = r
+                if not quiet:
+                    print(f"BYPASSED [{r.status_code}]")
+                best_result = r
             else:
-                print(f"FAILED ({r.error})")
+                if not quiet:
+                    print(f"FAILED ({r.error})")
                 if not r.bypassed:
                     for rp in ["chrome136", "chrome131", "firefox135", "safari18", "edge136"]:
-                        print(f"  -> rate limit retry ({rp})... ", end="")
+                        if not quiet:
+                            print(f"  -> rate limit retry ({rp})... ", end="")
                         self._random_delay(2.0, 5.0)
                         rr = self._try_curl_profile(url, rp)
                         self.results.append(rr)
                         if rr.bypassed:
-                            print(f"BYPASSED [{rr.status_code}]")  ; best_result = rr ; break
-                        print(f"BLOCKED ({rr.error or f'HTTP {rr.status_code}'})")
+                            if not quiet:
+                                print(f"BYPASSED [{rr.status_code}]")
+                            best_result = rr
+                            break
+                        if not quiet:
+                            print(f"BLOCKED ({rr.error or f'HTTP {rr.status_code}'})")
 
         elif waf_type == WAFType.CLOUDFLARE:
-            print(f"  -> cloudscraper... ", end="")
+            if not quiet:
+                print(f"  -> cloudscraper... ", end="")
             r = self._solve_cloudflare(url)
             self.results.append(r)
             if r.bypassed:
-                print(f"BYPASSED [{r.status_code}]")  ; best_result = r
+                if not quiet:
+                    print(f"BYPASSED [{r.status_code}]")
+                best_result = r
             else:
-                print(f"FAILED ({r.error})")
+                if not quiet:
+                    print(f"FAILED ({r.error})")
 
         elif waf_type == WAFType.AWS:
             profiles = ["chrome136", "chrome131", "firefox135", "safari18", "edge136"]
             for p in profiles:
-                print(f"  -> AWS bypass ({p})... ", end="")
+                if not quiet:
+                    print(f"  -> AWS bypass ({p})... ", end="")
                 self._random_delay(1.0, 3.0)
                 r = self._try_curl_profile(url, p)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r ; break
-                print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                    break
+                if not quiet:
+                    print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
 
         elif waf_type == WAFType.AKAMAI:
             profiles = ["chrome136", "chrome131", "edge136"]
             for p in profiles:
-                print(f"  -> Akamai bypass ({p})... ", end="")
+                if not quiet:
+                    print(f"  -> Akamai bypass ({p})... ", end="")
                 self._random_delay(1.0, 3.0)
                 r = self._try_curl_profile(url, p)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r ; break
-                print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                    break
+                if not quiet:
+                    print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
             if not best_result or not best_result.bypassed:
-                print(f"  -> Akamai slow proxy pass... ", end="")
+                if not quiet:
+                    print(f"  -> Akamai slow proxy pass... ", end="")
                 r = self._try_proxy_rotate(url)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r
-                else:
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                elif not quiet:
                     print(f"BLOCKED")
 
         elif waf_type in (WAFType.IMPERVA, WAFType.SUCURI):
-            print(f"  -> cloudscraper... ", end="")
+            if not quiet:
+                print(f"  -> cloudscraper... ", end="")
             r = self._solve_cloudflare(url)
             self.results.append(r)
             if r.bypassed:
-                print(f"BYPASSED [{r.status_code}]")  ; best_result = r
+                if not quiet:
+                    print(f"BYPASSED [{r.status_code}]")
+                best_result = r
             else:
-                print(f"FAILED ({r.error})")
+                if not quiet:
+                    print(f"FAILED ({r.error})")
                 for p in ["chrome136", "firefox135", "safari18"]:
-                    print(f"  -> bypass ({p})... ", end="")
+                    if not quiet:
+                        print(f"  -> bypass ({p})... ", end="")
                     r2 = self._try_curl_profile(url, p)
                     self.results.append(r2)
                     if r2.bypassed:
-                        print(f"BYPASSED [{r2.status_code}]")  ; best_result = r2 ; break
-                    print(f"BLOCKED")
+                        if not quiet:
+                            print(f"BYPASSED [{r2.status_code}]")
+                        best_result = r2
+                        break
+                    if not quiet:
+                        print(f"BLOCKED")
 
         elif waf_type == WAFType.F5:
             for p in ["chrome136", "firefox135"]:
-                print(f"  -> F5 bypass ({p})... ", end="")
+                if not quiet:
+                    print(f"  -> F5 bypass ({p})... ", end="")
                 r = self._try_curl_profile(url, p)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r ; break
-                print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                    break
+                if not quiet:
+                    print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
 
         elif waf_type == WAFType.MODSECURITY:
-            print(f"  -> ModSecurity bypass (header manipulation)... ", end="")
+            if not quiet:
+                print(f"  -> ModSecurity bypass (header manipulation)... ", end="")
             r = self._try_curl_profile(url, "chrome136")
             self.results.append(r)
             if r.bypassed:
-                print(f"BYPASSED [{r.status_code}]")  ; best_result = r
-            else:
+                if not quiet:
+                    print(f"BYPASSED [{r.status_code}]")
+                best_result = r
+            elif not quiet:
                 print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
 
         else:
-            print(f"  -> Unhandled WAF, trying generic bypass...")
+            if not quiet:
+                print(f"  -> Unhandled WAF, trying generic bypass...")
             for p in ["chrome136", "chrome131", "firefox135", "safari18", "edge136"]:
-                print(f"    -> {p}... ", end="")
+                if not quiet:
+                    print(f"    -> {p}... ", end="")
                 r = self._try_curl_profile(url, p)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r ; break
-                print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                    break
+                if not quiet:
+                    print(f"BLOCKED ({r.error or f'HTTP {r.status_code}'})")
             if best_result and not best_result.bypassed:
-                print(f"    -> cloudscraper (trial)... ", end="")
+                if not quiet:
+                    print(f"    -> cloudscraper (trial)... ", end="")
                 r = self._solve_cloudflare(url)
                 self.results.append(r)
                 if r.bypassed:
-                    print(f"BYPASSED [{r.status_code}]")  ; best_result = r
-                else:
+                    if not quiet:
+                        print(f"BYPASSED [{r.status_code}]")
+                    best_result = r
+                elif not quiet:
                     print(f"BLOCKED")
                 if not best_result.bypassed:
-                    print(f"    -> Vercel PoW solver... ", end="")
+                    if not quiet:
+                        print(f"    -> Vercel PoW solver... ", end="")
                     r = self._solve_vercel(url, "chrome136")
                     self.results.append(r)
                     if r.bypassed:
-                        print(f"BYPASSED [{r.status_code}]")  ; best_result = r
-                    else:
+                        if not quiet:
+                            print(f"BYPASSED [{r.status_code}]")
+                        best_result = r
+                    elif not quiet:
                         print(f"BLOCKED")
 
-        print()
+        if not quiet:
+            print()
         if best_result and best_result.bypassed:
-            print(f"[+] WAF BYPASSED using {best_result.profile_used} ({best_result.method_used})")
-            print(f"[+] Status: {best_result.status_code}")
-            print(f"[+] Response size: {len(best_result.body)} bytes")
-            print(f"[+] Server: {best_result.headers.get('Server', 'N/A')}")
-        elif best_result:
+            if not quiet:
+                print(f"[+] WAF BYPASSED using {best_result.profile_used} ({best_result.method_used})")
+                print(f"[+] Status: {best_result.status_code}")
+                print(f"[+] Response size: {len(best_result.body)} bytes")
+                print(f"[+] Server: {best_result.headers.get('Server', 'N/A')}")
+        elif best_result and not quiet:
             print(f"[-] All methods blocked by WAF ({waf_type})")
             print(f"[-] Best result: HTTP {best_result.status_code}")
             if best_result.error:
                 print(f"[-] {best_result.error}")
-            print(f"[-] Tip: use a proxy or browser automation (Playwright/Selenium)")
 
         return best_result or WAFResult(url=url, success=False, error="All methods failed")
 
 
-def main():
+# ==============================================================================
+# CLI entry point
+# ==============================================================================
+
+def waf_bypass_main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="WAF Bypass Tool — Auto-detect and bypass Vercel, Cloudflare, AWS, Akamai, Imperva, Sucuri, F5, and more",
+        description="WAF Bypass Tool -- Auto-detect and bypass Vercel, Cloudflare, AWS, Akamai, Imperva, Sucuri, F5, and more",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--target", "-t", type=str, default=None, help="Target URL")
@@ -715,4 +806,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(waf_bypass_main())

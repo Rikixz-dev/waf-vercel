@@ -22,6 +22,103 @@
 - **Auto-detection** — Identifies WAF type from response headers, cookies, and body
 - **CLI + Library** — Use as a command-line tool or import in your Python project
 
+## Architecture
+
+```mermaid
+flowchart TD
+    Start(["Target URL"]) --> Input["WAFBypass.bypass(url)"]
+    Input --> Probe["_probe(url)\ncurl_cffi GET"]
+    Probe --> Detect{"WAFDetector.detect()\nheaders / cookies / body"}
+    Detect -->|No WAF| Direct["Return OK"]
+    Detect -->|Vercel| Vercel["_solve_vercel()\nPoW hash solver"]
+    Detect -->|Cloudflare| CF["_solve_cloudflare()\ncloudscraper"]
+    Detect -->|AWS| AWS["_try_curl_profile()\n5 browser profiles"]
+    Detect -->|Akamai| Akamai["profile rotation\n+ proxy delay"]
+    Detect -->|Imperva / Sucuri| IS["cloudscraper\n+ fallback profiles"]
+    Detect -->|F5 / ModSecurity| F5["_try_curl_profile()\nheader manipulation"]
+    Detect -->|Unknown| Generic["exhaustive sweep\n5 profiles -> scraper -> vercel"]
+    Vercel --> VResult{"Bypassed?"}
+    VResult -->|Yes| Done["Return WAFResult"]
+    VResult -->|No| VRetry["retry with 5 profiles"]
+    VRetry --> VResult
+    CF --> Done
+    AWS --> Done
+    Akamai --> Done
+    IS --> Done
+    F5 --> Done
+    Generic --> Done
+    Done --> Output["bypassed / status / body / method"]
+```
+
+```
+┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐
+│   Target    │────>│  WAFBypass.bypass│────>│  _probe(url)     │
+│     URL     │     │  (entry point)   │     │  curl_cffi GET   │
+└─────────────┘     └─────────────────┘     └────────┬─────────┘
+                                                      │
+                                                      ▼
+                                            ┌─────────────────┐
+                                            │  WAFDetector     │
+                                            │  .detect()       │
+                                            │  headers/cookies │
+                                            │  body/status     │
+                                            └────────┬─────────┘
+                                                      │
+                          ┌───────────────────────────┼───────────────────────────┐
+                          ▼                           ▼                           ▼
+              ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+              │      Vercel         │     │     Cloudflare      │     │    AWS / Akamai     │
+              │  PoW hash solver    │     │   cloudscraper      │     │  profile rotation   │
+              │  SHA-256 brute force│     │   JS challenge      │     │  curl_cffi retry    │
+              └─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+                          │                           │                           │
+                          ▼                           ▼                           ▼
+              ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+              │   POST solution     │     │  Scraper creates    │     │  Try 5 browser      │
+              │   -> _vcrcs cookie  │     │  valid session      │     │  profiles           │
+              │   -> retry GET      │     │  -> retry GET       │     │  -> return first 200│
+              └─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+                          │                           │                           │
+                          └───────────────────────────┼───────────────────────────┘
+                                                      ▼
+                                            ┌─────────────────┐
+                                            │   WAFResult     │
+                                            │  .bypassed      │
+                                            │  .status_code   │
+                                            │  .body          │
+                                            │  .method_used   │
+                                            │  .profile_used  │
+                                            └─────────────────┘
+```
+
+### Data Flow (Vercel Example)
+
+```
+User                    WAFBypass                Target Server
+  │                         │                         │
+  │  bypass(url)            │                         │
+  │────────────────────────>│                         │
+  │                         │  GET / (probe)          │
+  │                         │────────────────────────>│
+  │                         │  423 + challenge token  │
+  │                         │<────────────────────────│
+  │                         │  Detect: VERCEL         │
+  │                         │  Solve PoW (CPU)        │
+  │                         │  Parse token            │
+  │                         │  SHA-256(seed+nonce)    │
+  │                         │  until prefix match     │
+  │                         │  POST solution          │
+  │                         │────────────────────────>│
+  │                         │  200 + _vcrcs cookie    │
+  │                         │<────────────────────────│
+  │                         │  GET / (retry)          │
+  │                         │────────────────────────>│
+  │                         │  200 (bypassed!)        │
+  │                         │<────────────────────────│
+  │  WAFResult(bypassed)    │                         │
+  │<────────────────────────│                         │
+```
+
 ## Quick Install
 
 ```bash
